@@ -5,7 +5,7 @@ YOLO-specific modules
 Usage:
     $ python path/to/models/yolo.py --cfg yolov5s.yaml
 """
-
+import os
 import argparse
 import sys
 from copy import deepcopy
@@ -50,6 +50,10 @@ class Detect(nn.Module):
         z = []  # inference output
         for i in range(self.nl):
             x[i] = self.m[i](x[i])  # conv
+
+            if os.getenv('RKNN_model_hack', '0') != '0':
+                continue
+
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
@@ -66,6 +70,9 @@ class Detect(nn.Module):
                     wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                     y = torch.cat((xy, wh, y[..., 4:]), -1)
                 z.append(y.view(bs, -1, self.no))
+
+        if os.getenv('RKNN_model_hack', '0') != '0':
+                return x
 
         return x if self.training else (torch.cat(z, 1), x)
 

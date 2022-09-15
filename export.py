@@ -42,6 +42,16 @@ import sys
 import time
 from pathlib import Path
 
+# activate rknn hack
+if len(sys.argv)>=3 and '--rknpu' in sys.argv:
+    _index = sys.argv.index('--rknpu')
+    if sys.argv[_index+1].upper() in ['RK1808', 'RV1109', 'RV1126','RK3399PRO']:
+        os.environ['RKNN_model_hack'] = 'npu_1'
+    elif sys.argv[_index+1].upper() in ['RK3566', 'RK3568', 'RK3588','RK3588S']:
+        os.environ['RKNN_model_hack'] = 'npu_2'
+    else:
+        assert False,"{} not recognized".format(sys.argv[_index+1])
+
 import torch
 import torch.nn as nn
 from torch.utils.mobile_optimizer import optimize_for_mobile
@@ -333,7 +343,8 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
         topk_per_class=100,  # TF.js NMS: topk per class to keep
         topk_all=100,  # TF.js NMS: topk for all classes to keep
         iou_thres=0.45,  # TF.js NMS: IoU threshold
-        conf_thres=0.25  # TF.js NMS: confidence threshold
+        conf_thres=0.25,  # TF.js NMS: confidence threshold
+        rknn_friendly = False,
         ):
     t = time.time()
     include = [x.lower() for x in include]
@@ -364,6 +375,60 @@ def run(data=ROOT / 'data/coco128.yaml',  # 'dataset.yaml path'
             m.inplace = inplace
             m.onnx_dynamic = dynamic
             # m.forward = m.forward_export  # assign forward (optional)
+
+        if os.getenv('RKNN_model_hack', '0') == 'npu_1':
+            from models.common import Focus
+            from models.common_rk_plug_in import surrogate_focus
+            if isinstance(model.model[0], Focus):
+                # For yolo v5 version
+                surrogate_focous = surrogate_focus(int(model.model[0].conv.conv.weight.shape[1]/4),
+                                                model.model[0].conv.conv.weight.shape[0],
+                                                k=tuple(model.model[0].conv.conv.weight.shape[2:4]),
+                                                s=model.model[0].conv.conv.stride,
+                                                p=model.model[0].conv.conv.padding,
+                                                g=model.model[0].conv.conv.groups,
+                                                act=True)
+                surrogate_focous.conv.conv.weight = model.model[0].conv.conv.weight
+                surrogate_focous.conv.conv.bias = model.model[0].conv.conv.bias
+                surrogate_focous.conv.act = model.model[0].conv.act
+                temp_i = model.model[0].i
+                temp_f = model.model[0].f
+
+                model.model[0] = surrogate_focous
+                model.model[0].i = temp_i
+                model.model[0].f = temp_f
+                model.model[0].eval()
+            elif isinstance(model.model[0], Conv) and model.model[0].conv.kernel_size == (6, 6):
+                # For yolo v6 version
+                surrogate_focous = surrogate_focus(model.model[0].conv.weight.shape[1],
+                                                model.model[0].conv.weight.shape[0],
+                                                k=(3,3), # 6/2, 6/2
+                                                s=1,
+                                                p=(1,1), # 2/2, 2/2
+                                                g=model.model[0].conv.groups,
+                                                act=hasattr(model.model[0], 'act'))
+                surrogate_focous.conv.conv.weight[:,:3,:,:] = model.model[0].conv.weight[:,:,::2,::2]
+                surrogate_focous.conv.conv.weight[:,3:6,:,:] = model.model[0].conv.weight[:,:,1::2,::2]
+                surrogate_focous.conv.conv.weight[:,6:9,:,:] = model.model[0].conv.weight[:,:,::2,1::2]
+                surrogate_focous.conv.conv.weight[:,9:,:,:] = model.model[0].conv.weight[:,:,1::2,1::2]
+                surrogate_focous.conv.conv.bias = model.model[0].conv.bias
+                surrogate_focous.conv.act = model.model[0].act
+                temp_i = model.model[0].i
+                temp_f = model.model[0].f
+
+                model.model[0] = surrogate_focous
+                model.model[0].i = temp_i
+                model.model[0].f = temp_f
+                model.model[0].eval()
+
+    # save anchors
+    if isinstance(model.model[-1], Detect):
+        print('---> save anchors for RKNN')
+        RK_anchors = model.model[-1].stride.reshape(3,1).repeat(1,3).reshape(-1,1)* model.model[-1].anchors.reshape(9,2)
+        RK_anchors = RK_anchors.tolist()
+        print(RK_anchors)
+        with open(file.with_suffix('.anchors.txt'), 'w') as anf:
+            anf.write(str(RK_anchors))
 
     for _ in range(2):
         y = model(im)  # dry runs
@@ -413,7 +478,7 @@ def parse_opt():
     parser.add_argument('--int8', action='store_true', help='CoreML/TF INT8 quantization')
     parser.add_argument('--dynamic', action='store_true', help='ONNX/TF: dynamic axes')
     parser.add_argument('--simplify', action='store_true', help='ONNX: simplify model')
-    parser.add_argument('--opset', type=int, default=14, help='ONNX: opset version')
+    parser.add_argument('--opset', type=int, default=12, help='ONNX: opset version')
     parser.add_argument('--verbose', action='store_true', help='TensorRT: verbose log')
     parser.add_argument('--workspace', type=int, default=4, help='TensorRT: workspace size (GB)')
     parser.add_argument('--nms', action='store_true', help='TF: add NMS to model')
@@ -425,6 +490,7 @@ def parse_opt():
     parser.add_argument('--include', nargs='+',
                         default=['torchscript', 'onnx'],
                         help='available formats are (torchscript, onnx, engine, coreml, saved_model, pb, tflite, tfjs)')
+    parser.add_argument('--rknpu', default=None, help='RKNN npu platform')
     opt = parser.parse_args()
     print_args(FILE.stem, opt)
     return opt
@@ -437,4 +503,5 @@ def main(opt):
 
 if __name__ == "__main__":
     opt = parse_opt()
+    del opt.rknpu
     main(opt)

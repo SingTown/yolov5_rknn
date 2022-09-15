@@ -2,7 +2,7 @@
 """
 Common modules
 """
-
+import os
 import json
 import math
 import platform
@@ -40,7 +40,7 @@ class Conv(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.SiLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
+        self.act = nn.ReLU() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -114,7 +114,7 @@ class BottleneckCSP(nn.Module):
         self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
-        self.act = nn.SiLU()
+        self.act = nn.ReLU()
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
@@ -161,39 +161,91 @@ class C3Ghost(C3):
         c_ = int(c2 * e)  # hidden channels
         self.m = nn.Sequential(*(GhostBottleneck(c_, c_) for _ in range(n)))
 
+if os.getenv('RKNN_model_hack', '0') == '0':
+    class SPP(nn.Module):
+        # Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729
+        def __init__(self, c1, c2, k=(5, 9, 13)):
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+            self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
 
-class SPP(nn.Module):
-    # Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729
-    def __init__(self, c1, c2, k=(5, 9, 13)):
-        super().__init__()
-        c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
-        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+        def forward(self, x):
+            x = self.cv1(x)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+                return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
+elif os.getenv('RKNN_model_hack', '0') in ['npu_1', 'npu_2']:
+    # TODO remove this hack when rknn-toolkit1/2 add this optimize rules
+    class SPP(nn.Module):
+        def __init__(self, c1, c2, k=(5, 9, 13)):
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+            self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+            for value in k:
+                assert (value%2 == 1) and (value!= 1), "value in [{}] only support odd number for RKNN model hack"
 
-    def forward(self, x):
-        x = self.cv1(x)
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
-            return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
+        def forward(self, x):
+            x = self.cv1(x)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+                y = [x]
+                for maxpool in self.m:
+                    kernel_size = maxpool.kernel_size
+                    m = x
+                    for i in range(math.floor(kernel_size/2)):
+                        m = torch.nn.functional.max_pool2d(m, 3, 1, 1)
+                    y = [*y, m]
+            return self.cv2(torch.cat(y, 1))
 
+if os.getenv('RKNN_model_hack', '0') in ['0','npu_2']:
+    class SPPF(nn.Module):
+        # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
+        def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * 4, c2, 1, 1)
+            self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
-class SPPF(nn.Module):
-    # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
-    def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
-        super().__init__()
-        c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        def forward(self, x):
+            x = self.cv1(x)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+                y1 = self.m(x)
+                y2 = self.m(y1)
+                return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+elif os.getenv('RKNN_model_hack', '0') == 'npu_1':
+    class SPPF(nn.Module):
+        # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
+        def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+            super().__init__()
+            c_ = c1 // 2  # hidden channels
+            self.cv1 = Conv(c1, c_, 1, 1)
+            self.cv2 = Conv(c_ * 4, c2, 1, 1)
+            self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
-    def forward(self, x):
-        x = self.cv1(x)
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
-            y1 = self.m(x)
-            y2 = self.m(y1)
-            return self.cv2(torch.cat([x, y1, y2, self.m(y2)], 1))
+        def forward(self, x):
+            x = self.cv1(x)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+                y1 = self.m(x)
+                y2 = self.m(y1)
+
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
+                y = [x]
+                kernel_size = self.m.kernel_size
+                _3x3_stack = math.floor(kernel_size/2)
+                for i in range(3):
+                    m = y[-1]
+                    for _ in range(_3x3_stack):
+                        m = torch.nn.functional.max_pool2d(m, 3, 1, 1)
+                    y = [*y, m]
+            return self.cv2(torch.cat(y, 1))
 
 
 class Focus(nn.Module):
@@ -287,14 +339,15 @@ class DetectMultiBackend(nn.Module):
         #   ONNX Runtime:           *.onnx
         #   OpenCV DNN:             *.onnx with dnn=True
         #   TensorRT:               *.engine
+        #   RKNN:                   *.rknn
         from models.experimental import attempt_download, attempt_load  # scoped to avoid circular import
 
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
         suffix = Path(w).suffix.lower()
-        suffixes = ['.pt', '.torchscript', '.onnx', '.engine', '.tflite', '.pb', '', '.mlmodel']
+        suffixes = ['.pt', '.torchscript', '.onnx', '.engine', '.tflite', '.pb', '', '.mlmodel', '.rknn']
         check_suffix(w, suffixes)  # check weights have acceptable suffix
-        pt, jit, onnx, engine, tflite, pb, saved_model, coreml = (suffix == x for x in suffixes)  # backend booleans
+        pt, jit, onnx, engine, tflite, pb, saved_model, coreml, rknn_model = (suffix == x for x in suffixes)  # backend booleans
         stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
         attempt_download(w)  # download if not local
 
@@ -342,6 +395,9 @@ class DetectMultiBackend(nn.Module):
             binding_addrs = OrderedDict((n, d.ptr) for n, d in bindings.items())
             context = model.create_execution_context()
             batch_size = bindings['images'].shape[0]
+        elif rknn_model:
+            # TODO if post-process in model, then we can add code here.
+            pass
         else:  # TensorFlow model (TFLite, pb, saved_model)
             if pb:  # https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
                 LOGGER.info(f'Loading {w} for TensorFlow *.pb inference...')
@@ -402,6 +458,9 @@ class DetectMultiBackend(nn.Module):
             self.binding_addrs['images'] = int(im.data_ptr())
             self.context.execute_v2(list(self.binding_addrs.values()))
             y = self.bindings['output'].data
+        elif self.rknn_model:
+            # TODO if post-process in model, then we can add code here.
+            pass
         else:  # TensorFlow model (TFLite, pb, saved_model)
             im = im.permute(0, 2, 3, 1).cpu().numpy()  # torch BCHW to numpy BHWC shape(1,320,192,3)
             if self.pb:
