@@ -8,10 +8,9 @@ RUN apt update && apt install -y zip htop screen libgl1-mesa-glx
 
 # Install python dependencies
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip
+RUN python -m pip install -i http://pypi.douban.com/simple --trusted-host pypi.douban.com --upgrade pip
 RUN pip uninstall -y nvidia-tensorboard nvidia-tensorboard-plugin-dlprof
-RUN pip install --no-cache -r requirements.txt coremltools onnx gsutil notebook wandb>=0.12.2
-RUN pip install --no-cache -U torch torchvision numpy Pillow
+RUN pip install --no-cache -i http://pypi.douban.com/simple --trusted-host pypi.douban.com -r requirements.txt opencv_python==4.5.5.64 Pillow==9.2.0
 # RUN pip install --no-cache torch==1.10.0+cu113 torchvision==0.11.1+cu113 -f https://download.pytorch.org/whl/cu113/torch_stable.html
 
 # Create working directory
